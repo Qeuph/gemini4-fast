@@ -15,6 +15,7 @@ import argparse
 import itertools
 import readline  # Enables Unix line editing and command history for input().
 import sys
+import termios
 import threading
 import time
 from dataclasses import dataclass, field
@@ -42,10 +43,17 @@ DEFAULT_TOP_K = 64
 DEFAULT_NUM_ASSISTANT_TOKENS = 5
 DEFAULT_STREAM_TIMEOUT: float | None = None
 DEFAULT_MAX_HISTORY_TURNS: int | None = None
+DEFAULT_SHOW_THINKING = False
+DEFAULT_SHOW_TPS = False
 
 # ── Gemma thinking-block delimiters ───────────────────────────────────────────
 THINK_OPEN_TAG = "<|channel>thought"
 THINK_CLOSE_TAG = "<channel|>"
+GENERATED_SPECIAL_TOKENS = (
+    "<turn|>",
+    "<end_of_turn>",
+    "<eos>",
+)
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 C_THINK = "\033[2;36m"  # dim cyan   → thinking block
@@ -92,12 +100,13 @@ class ChatConfig:
     top_k: int = DEFAULT_TOP_K
     num_assistant_tokens: int = DEFAULT_NUM_ASSISTANT_TOKENS
     enable_thinking: bool = True
-    show_thinking: bool = True
+    show_thinking: bool = DEFAULT_SHOW_THINKING
     enable_mtp: bool = True
     dtype: str = "auto"
     device_map: str = "auto"
     stream_timeout: float | None = DEFAULT_STREAM_TIMEOUT
     max_history_turns: int | None = DEFAULT_MAX_HISTORY_TURNS
+    show_tps: bool = DEFAULT_SHOW_TPS
 
 
 @dataclass(slots=True)
@@ -130,6 +139,23 @@ def cprint(text: str, color: str = C_RESET, end: str = "\n", flush: bool = False
         sys.stdout.flush()
 
 
+def ensure_terminal_echo() -> None:
+    """Best-effort restore of stdin echo before prompting for user input."""
+    if not sys.stdin.isatty():
+        return
+    try:
+        attrs = termios.tcgetattr(sys.stdin.fileno())
+    except termios.error:
+        return
+    if attrs[3] & termios.ECHO:
+        return
+    attrs[3] |= termios.ECHO
+    try:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attrs)
+    except termios.error:
+        pass
+
+
 def show_help(config: ChatConfig) -> None:
     cmds = [
         ("quit / exit", "End the session"),
@@ -140,6 +166,7 @@ def show_help(config: ChatConfig) -> None:
         ("mtp on/off", "Enable or disable MTP speculative decoding"),
         ("mtp status", "Show target, drafter, and current MTP state"),
         ("tokens <n>", "Change max_new_tokens for future turns"),
+        ("tps on/off", "Show or hide live token-per-second stats"),
         ("/help", "Show this message"),
     ]
     cprint("\nAvailable commands:", C_LABEL)
@@ -152,12 +179,14 @@ def show_help(config: ChatConfig) -> None:
 def print_mtp_status(config: ChatConfig) -> None:
     state = "ON" if config.enable_mtp else "OFF"
     max_history = "unlimited" if config.max_history_turns is None else str(config.max_history_turns)
+    tps_state = "ON" if config.show_tps else "OFF"
     cprint("\nMTP speculative decoding:", C_LABEL)
     cprint(f"  state:               {state}", C_CMD)
     cprint(f"  target model:        {config.target_model_id}", C_CMD)
     cprint(f"  MTP draft model:     {config.mtp_draft_model_id}", C_CMD)
     cprint(f"  draft tokens/step:   {config.num_assistant_tokens}", C_CMD)
-    cprint(f"  max history turns:   {max_history}\n", C_CMD)
+    cprint(f"  max history turns:   {max_history}", C_CMD)
+    cprint(f"  live TPS stats:      {tps_state}\n", C_CMD)
 
 
 def format_loading_error(exc: Exception, config: ChatConfig) -> str:
@@ -233,6 +262,14 @@ def build_messages(history: list[dict[str, str]], enable_thinking: bool) -> list
     return [{"role": "system", "content": system_content(enable_thinking)}] + history
 
 
+def strip_generated_special_tokens(text: str) -> str:
+    """Remove generated turn/end markers that should not be shown or saved."""
+    cleaned = text
+    for token in GENERATED_SPECIAL_TOKENS:
+        cleaned = cleaned.replace(token, "")
+    return cleaned.strip()
+
+
 def extract_final_answer(raw: str) -> str:
     """Strip all complete or dangling Gemma thinking blocks from assistant history."""
     output_parts: list[str] = []
@@ -255,7 +292,7 @@ def extract_final_answer(raw: str) -> str:
             break
         cursor = close_idx + len(THINK_CLOSE_TAG)
 
-    return "".join(output_parts).strip()
+    return strip_generated_special_tokens("".join(output_parts))
 
 
 def parse_final_answer(processor: Any, raw_output: str, enable_thinking: bool) -> str:
@@ -263,18 +300,21 @@ def parse_final_answer(processor: Any, raw_output: str, enable_thinking: bool) -
     if not raw_output:
         return ""
     if not enable_thinking:
-        return raw_output.strip()
+        return strip_generated_special_tokens(raw_output)
 
     parse_response = getattr(processor, "parse_response", None)
     if callable(parse_response):
         try:
             parsed = parse_response(raw_output)
             if isinstance(parsed, dict):
-                parsed_text = str(parsed.get("text", "")).strip()
+                parsed_text = next(
+                    (str(parsed[key]).strip() for key in ("text", "content", "answer") if parsed.get(key)),
+                    "",
+                )
             else:
                 parsed_text = str(parsed).strip()
-            if THINK_OPEN_TAG not in parsed_text and THINK_CLOSE_TAG not in parsed_text:
-                return parsed_text
+            if parsed_text and THINK_OPEN_TAG not in parsed_text and THINK_CLOSE_TAG not in parsed_text:
+                return strip_generated_special_tokens(parsed_text)
         except (AttributeError, KeyError, TypeError, ValueError):
             pass
 
@@ -291,9 +331,15 @@ def render_chunk(buf: str, in_think: bool, show_thinking: bool) -> None:
         cprint(buf, C_ANSWER, end="", flush=True)
 
 
-def render_tps(token_count: int, started_at: float, final: bool = False) -> None:
+def find_first_marker(buffer: str, markers: tuple[str, ...]) -> tuple[int, str] | None:
+    """Return the earliest complete marker found in the current stream buffer."""
+    matches = ((idx, marker) for marker in markers if (idx := buffer.find(marker)) != -1)
+    return min(matches, default=None, key=lambda item: item[0])
+
+
+def render_tps(token_count: int, started_at: float, show_tps: bool, final: bool = False) -> None:
     """Render a lightweight approximate token-per-second indicator on TTYs."""
-    if not sys.stderr.isatty():
+    if not show_tps or not sys.stderr.isatty():
         return
     elapsed = max(time.perf_counter() - started_at, 1e-9)
     suffix = "\n" if final else ""
@@ -316,6 +362,7 @@ def stream_response(
     streamer: TextIteratorStreamer,
     tokenizer: Any,
     show_thinking: bool,
+    show_tps: bool,
     stop_event: threading.Event,
 ) -> str:
     """
@@ -327,48 +374,41 @@ def stream_response(
     buffer = ""
     token_count = 0
     started_at = time.perf_counter()
-    max_lookahead = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG)) - 1
+    hidden_markers = (THINK_OPEN_TAG, THINK_CLOSE_TAG, *GENERATED_SPECIAL_TOKENS)
+    max_lookahead = max(len(marker) for marker in hidden_markers) - 1
 
     try:
         for token in streamer:
             token_count += estimate_token_count(tokenizer, token)
             raw_output += token
             buffer += token
-            render_tps(token_count, started_at)
+            render_tps(token_count, started_at, show_tps)
 
             while True:
-                if not in_thinking:
-                    idx = buffer.find(THINK_OPEN_TAG)
-                    if idx == 0:
-                        in_thinking = True
-                        if show_thinking:
-                            cprint("\n── thinking ──", C_LABEL)
-                        buffer = buffer[len(THINK_OPEN_TAG) :]
-                    elif idx > 0:
-                        render_chunk(buffer[:idx], in_think=False, show_thinking=show_thinking)
-                        buffer = buffer[idx:]
-                    else:
-                        safe_len = max(0, len(buffer) - max_lookahead)
-                        if safe_len > 0:
-                            render_chunk(buffer[:safe_len], in_think=False, show_thinking=show_thinking)
-                            buffer = buffer[safe_len:]
-                        break
-                else:
-                    idx = buffer.find(THINK_CLOSE_TAG)
-                    if idx == 0:
-                        in_thinking = False
-                        if show_thinking:
-                            cprint("\n── answer ────", C_LABEL)
-                        buffer = buffer[len(THINK_CLOSE_TAG) :]
-                    elif idx > 0:
-                        render_chunk(buffer[:idx], in_think=True, show_thinking=show_thinking)
-                        buffer = buffer[idx:]
-                    else:
-                        safe_len = max(0, len(buffer) - max_lookahead)
-                        if safe_len > 0:
-                            render_chunk(buffer[:safe_len], in_think=True, show_thinking=show_thinking)
-                            buffer = buffer[safe_len:]
-                        break
+                marker_match = find_first_marker(buffer, hidden_markers)
+                if marker_match is None:
+                    safe_len = max(0, len(buffer) - max_lookahead)
+                    if safe_len > 0:
+                        render_chunk(buffer[:safe_len], in_think=in_thinking, show_thinking=show_thinking)
+                        buffer = buffer[safe_len:]
+                    break
+
+                idx, marker = marker_match
+                if idx > 0:
+                    render_chunk(buffer[:idx], in_think=in_thinking, show_thinking=show_thinking)
+                    buffer = buffer[idx:]
+                    continue
+
+                if marker == THINK_OPEN_TAG:
+                    in_thinking = True
+                    if show_thinking:
+                        cprint("\n── thinking ──", C_LABEL)
+                elif marker == THINK_CLOSE_TAG:
+                    in_thinking = False
+                    if show_thinking:
+                        cprint("\n── answer ────", C_LABEL)
+
+                buffer = buffer[len(marker) :]
     except KeyboardInterrupt as exc:
         stop_event.set()
         streamer.end()
@@ -376,9 +416,9 @@ def stream_response(
     except Empty as exc:
         raise RuntimeError("timed out waiting for streamed model output") from exc
     finally:
-        render_tps(token_count, started_at, final=True)
+        render_tps(token_count, started_at, show_tps, final=True)
 
-    render_chunk(buffer, in_think=in_thinking, show_thinking=show_thinking)
+    render_chunk(strip_generated_special_tokens(buffer), in_think=in_thinking, show_thinking=show_thinking)
     print()
     return raw_output
 
@@ -534,6 +574,7 @@ def generate_turn(
             streamer,
             tokenizer=tokenizer,
             show_thinking=config.show_thinking,
+            show_tps=config.show_tps,
             stop_event=stop_event,
         )
     except GenerationInterrupted:
@@ -670,6 +711,16 @@ def handle_command(
             cprint("[Usage: tokens <positive integer>]\n", C_ERR)
         return True
 
+    if lower == "tps on":
+        config.show_tps = True
+        cprint("[Live token-per-second stats ON]\n", C_LABEL)
+        return True
+
+    if lower == "tps off":
+        config.show_tps = False
+        cprint("[Live token-per-second stats OFF]\n", C_LABEL)
+        return True
+
     if lower == "/help":
         show_help(config)
         return True
@@ -683,6 +734,7 @@ def read_multiline_input() -> str:
     prompt = "You: "
 
     while True:
+        ensure_terminal_echo()
         cprint(prompt, C_CMD, end="", flush=True)
         line = input()
         if line.endswith("\\"):
@@ -700,7 +752,7 @@ def chat(config: ChatConfig, loaded: LoadedModels) -> None:
         "╔══════════════════════════════════════════════════════╗\n"
         "║ Gemma 4 · MTP Speculative Decoding Chatbot · v2.1  ║\n"
         "╚══════════════════════════════════════════════════════╝\n"
-        "  Type /help for commands. MTP is enabled by default.\n"
+        "  Type /help for commands. MTP is enabled by default; thinking is hidden by default.\n"
     )
     cprint(banner, C_LABEL)
 
@@ -776,8 +828,13 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
         help="Maximum user/assistant turns to keep in context; disabled by default.",
     )
     parser.add_argument("--no-thinking", action="store_true", help="Disable Gemma thinking prompts.")
-    parser.add_argument("--hide-thinking", action="store_true", help="Do not print thinking blocks while streaming.")
+    parser.add_argument("--show-thinking", action="store_true", help="Print thinking blocks while streaming.")
     parser.add_argument("--disable-mtp", action="store_true", help="Run target-only generation without the MTP drafter.")
+    parser.add_argument(
+        "--show-tps",
+        action="store_true",
+        help="Print live token-per-second stats while streaming. Disabled by default to avoid corrupting streamed text on some terminals.",
+    )
 
     args = parser.parse_args(argv)
     if args.max_new_tokens <= 0:
@@ -804,12 +861,13 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
         top_k=args.top_k,
         num_assistant_tokens=args.num_assistant_tokens,
         enable_thinking=not args.no_thinking,
-        show_thinking=not args.hide_thinking,
+        show_thinking=args.show_thinking,
         enable_mtp=not args.disable_mtp,
         dtype=args.dtype,
         device_map=args.device_map,
         stream_timeout=args.stream_timeout,
         max_history_turns=args.max_history_turns,
+        show_tps=args.show_tps,
     )
 
 

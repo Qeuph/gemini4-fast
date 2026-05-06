@@ -23,7 +23,7 @@ In this repo, MTP is enabled by default by passing the loaded drafter as `assist
 - Runtime MTP controls: `mtp status`, `mtp on`, and `mtp off`.
 - Runtime thinking controls: `think on`, `think off`, `think show`, and `think hide`.
 - Conversation reset and history truncation without restarting the process.
-- Live token-per-second display on interactive terminals.
+- Optional live token-per-second display on interactive terminals (`--show-tps` or `tps on`).
 - Graceful Ctrl+C handling during generation: the current stream is cancelled and the chat prompt returns.
 - CLI flags for model IDs, sampling settings, dtype, device mapping, draft-token count, history size, and optional stream timeouts.
 - Clean conversation history: thinking blocks are stripped before assistant turns are stored.
@@ -71,10 +71,16 @@ Disable MTP for a baseline comparison:
 python main.py --disable-mtp
 ```
 
-Hide streamed thinking blocks while still keeping thinking enabled:
+Thinking is hidden by default while still being enabled for the model. To inspect streamed thinking blocks for debugging:
 
 ```bash
-python main.py --hide-thinking
+python main.py --show-thinking
+```
+
+Live token-per-second stats are also hidden by default to keep streamed answers readable. Enable them when benchmarking:
+
+```bash
+python main.py --show-tps
 ```
 
 Limit stored conversation context to the most recent 8 turns:
@@ -111,9 +117,10 @@ python main.py --stream-timeout 120
 | `truncate` | Use the `--max-history-turns` value to trim history, if one was configured. |
 | `think on` / `think off` | Enable or disable thinking prompts for future turns. |
 | `think show` / `think hide` | Show or hide streamed thinking blocks. |
-| `mtp status` | Print the target model, draft model, draft-token setting, and history limit. |
+| `mtp status` | Print the target model, draft model, draft-token setting, history limit, and live TPS state. |
 | `mtp on` / `mtp off` | Enable or disable use of the already-loaded MTP drafter. |
 | `tokens <n>` | Change `max_new_tokens` for future turns. |
+| `tps on` / `tps off` | Show or hide live token-per-second stats. |
 | `/help` | Show the command list. |
 
 ### Multi-line input
@@ -132,9 +139,10 @@ The CLI joins the entered lines with newline characters and sends them as one us
 
 Gemma chat templates can add model-specific thinking tokens when `apply_chat_template(..., enable_thinking=True)` is used. The CLI intentionally leaves those tokens out of the system prompt and lets the processor template add the right control tokens.
 
-Raw streamed output is kept intact while rendering so the terminal can color or hide thinking text separately from the final answer. Before an assistant message is stored in conversation history, the CLI cleans it:
+Raw streamed output is kept intact in memory while rendering hides generated control tokens, so the terminal can show or hide thinking text separately from the final answer. Before an assistant message is stored in conversation history, the CLI cleans it:
 
 - all complete thinking blocks are removed, including multiple blocks in one response;
+- generated turn/end markers such as `<turn|>` are removed from displayed and saved answers;
 - if a thinking block opens but never closes, the unterminated thinking portion is discarded and a warning is printed;
 - the cleaned final answer is what future turns see in history.
 
@@ -170,7 +178,7 @@ python main.py --disable-mtp
 python main.py --num-assistant-tokens 5
 ```
 
-Use realistic prompts and long enough generations to measure decode throughput. The live token-per-second indicator gives a quick interactive read, but for rigorous benchmarking you should still run repeated trials and compare end-to-end latency.
+Use realistic prompts and long enough generations to measure decode throughput. The optional live token-per-second indicator (`--show-tps`) gives a quick interactive read, but for rigorous benchmarking you should still run repeated trials and compare end-to-end latency.
 
 ## Troubleshooting
 
@@ -178,7 +186,7 @@ Use realistic prompts and long enough generations to measure decode throughput. 
 - **Model access errors:** accept the model terms on Hugging Face and run `huggingface-cli login`.
 - **Automatic device placement fails:** try `--device-map sequential` or a smaller model pair.
 - **No speedup:** speculative decoding helps most when the drafter is much faster than the target and draft-token acceptance is high. Try tuning `--num-assistant-tokens`.
-- **Unexpected thinking text in history:** raw streamed output keeps special tokens visible for the renderer, but saved assistant turns are sanitized before being reused.
+- **Unexpected thinking text in history:** raw streamed output keeps control tokens available for the renderer, but displayed text and saved assistant turns are sanitized before being reused.
 - **Streaming appears stuck:** generation failures in the worker thread are surfaced back to the chat loop. For long-running remote or overloaded environments, set `--stream-timeout <seconds>` to fail a turn if no streamed chunks arrive before the timeout.
 - **Ctrl+C during generation:** the CLI requests generation cancellation, ends the current stream, removes the interrupted user turn from history, and returns to the prompt instead of exiting the process.
 
