@@ -22,7 +22,7 @@ In this repo, MTP is enabled by default by passing the loaded drafter as `assist
 - Runtime MTP controls: `mtp status`, `mtp on`, and `mtp off`.
 - Runtime thinking controls: `think on`, `think off`, `think show`, and `think hide`.
 - Conversation reset without restarting the process.
-- CLI flags for model IDs, sampling settings, dtype, device mapping, and draft-token count.
+- CLI flags for model IDs, sampling settings, dtype, device mapping, draft-token count, and optional stream timeouts.
 - Clean conversation history: thinking blocks are stripped before assistant turns are stored.
 
 ## Install
@@ -77,6 +77,12 @@ Use a specific device map or dtype:
 python main.py --device-map auto --dtype auto
 ```
 
+Treat stalled streaming as an error after 120 seconds without a chunk:
+
+```bash
+python main.py --stream-timeout 120
+```
+
 ## In-chat commands
 
 | Command | Description |
@@ -120,6 +126,7 @@ Use realistic prompts and long enough generations to measure decode throughput. 
 - **Model access errors:** accept the model terms on Hugging Face and run `huggingface-cli login`.
 - **No speedup:** speculative decoding helps most when the drafter is much faster than the target and draft-token acceptance is high. Try tuning `--num-assistant-tokens`.
 - **Unexpected thinking text in history:** the app strips Gemma thinking delimiters before saving assistant turns, but raw streamed output keeps special tokens visible so the renderer can separate thinking from answers.
+- **Streaming appears stuck:** generation failures in the worker thread are surfaced back to the chat loop. For long-running remote or overloaded environments, set `--stream-timeout <seconds>` to fail a turn if no streamed chunks arrive before the timeout.
 
 ## Development checks
 

@@ -15,6 +15,7 @@ import argparse
 import sys
 import threading
 from dataclasses import dataclass
+from queue import Empty
 from typing import Any
 
 import torch
@@ -30,6 +31,7 @@ DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 0.95
 DEFAULT_TOP_K = 64
 DEFAULT_NUM_ASSISTANT_TOKENS = 5
+DEFAULT_STREAM_TIMEOUT: float | None = None
 
 # ── Gemma thinking-block delimiters ───────────────────────────────────────────
 THINK_OPEN_TAG = "<|channel>thought"
@@ -60,6 +62,7 @@ class ChatConfig:
     enable_mtp: bool = True
     dtype: str = "auto"
     device_map: str = "auto"
+    stream_timeout: float | None = DEFAULT_STREAM_TIMEOUT
 
 
 @dataclass(slots=True)
@@ -181,43 +184,46 @@ def stream_response(streamer: TextIteratorStreamer, show_thinking: bool) -> str:
 
     max_lookahead = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG)) - 1
 
-    for token in streamer:
-        raw_output += token
-        buffer += token
+    try:
+        for token in streamer:
+            raw_output += token
+            buffer += token
 
-        while True:
-            if not in_thinking:
-                idx = buffer.find(THINK_OPEN_TAG)
-                if idx == 0:
-                    in_thinking = True
-                    if show_thinking:
-                        cprint("\n── thinking ──", C_LABEL)
-                    buffer = buffer[len(THINK_OPEN_TAG) :]
-                elif idx > 0:
-                    render_chunk(buffer[:idx], in_think=False, show_thinking=show_thinking)
-                    buffer = buffer[idx:]
+            while True:
+                if not in_thinking:
+                    idx = buffer.find(THINK_OPEN_TAG)
+                    if idx == 0:
+                        in_thinking = True
+                        if show_thinking:
+                            cprint("\n── thinking ──", C_LABEL)
+                        buffer = buffer[len(THINK_OPEN_TAG) :]
+                    elif idx > 0:
+                        render_chunk(buffer[:idx], in_think=False, show_thinking=show_thinking)
+                        buffer = buffer[idx:]
+                    else:
+                        safe_len = max(0, len(buffer) - max_lookahead)
+                        if safe_len > 0:
+                            render_chunk(buffer[:safe_len], in_think=False, show_thinking=show_thinking)
+                            buffer = buffer[safe_len:]
+                        break
                 else:
-                    safe_len = max(0, len(buffer) - max_lookahead)
-                    if safe_len > 0:
-                        render_chunk(buffer[:safe_len], in_think=False, show_thinking=show_thinking)
-                        buffer = buffer[safe_len:]
-                    break
-            else:
-                idx = buffer.find(THINK_CLOSE_TAG)
-                if idx == 0:
-                    in_thinking = False
-                    if show_thinking:
-                        cprint("\n── answer ────", C_LABEL)
-                    buffer = buffer[len(THINK_CLOSE_TAG) :]
-                elif idx > 0:
-                    render_chunk(buffer[:idx], in_think=True, show_thinking=show_thinking)
-                    buffer = buffer[idx:]
-                else:
-                    safe_len = max(0, len(buffer) - max_lookahead)
-                    if safe_len > 0:
-                        render_chunk(buffer[:safe_len], in_think=True, show_thinking=show_thinking)
-                        buffer = buffer[safe_len:]
-                    break
+                    idx = buffer.find(THINK_CLOSE_TAG)
+                    if idx == 0:
+                        in_thinking = False
+                        if show_thinking:
+                            cprint("\n── answer ────", C_LABEL)
+                        buffer = buffer[len(THINK_CLOSE_TAG) :]
+                    elif idx > 0:
+                        render_chunk(buffer[:idx], in_think=True, show_thinking=show_thinking)
+                        buffer = buffer[idx:]
+                    else:
+                        safe_len = max(0, len(buffer) - max_lookahead)
+                        if safe_len > 0:
+                            render_chunk(buffer[:safe_len], in_think=True, show_thinking=show_thinking)
+                            buffer = buffer[safe_len:]
+                        break
+    except Empty as exc:
+        raise RuntimeError("timed out waiting for streamed model output") from exc
 
     render_chunk(buffer, in_think=in_thinking, show_thinking=show_thinking)
     print()
@@ -291,6 +297,21 @@ def build_generation_kwargs(
     return gen_kwargs
 
 
+def run_generation_worker(
+    target_model: Any,
+    gen_kwargs: dict[str, Any],
+    streamer: TextIteratorStreamer,
+    errors: list[Exception],
+) -> None:
+    """Run generation in a worker thread and unblock the streamer on failure."""
+    try:
+        with torch.inference_mode():
+            target_model.generate(**gen_kwargs)
+    except Exception as exc:
+        errors.append(exc)
+        streamer.end()
+
+
 def generate_turn(
     config: ChatConfig,
     loaded: LoadedModels,
@@ -311,12 +332,14 @@ def generate_turn(
         tokenizer,
         skip_prompt=True,
         skip_special_tokens=False,
+        timeout=config.stream_timeout,
     )
     gen_kwargs = build_generation_kwargs(config, loaded, inputs, streamer)
+    generation_errors: list[Exception] = []
 
     gen_thread = threading.Thread(
-        target=loaded.target_model.generate,
-        kwargs=gen_kwargs,
+        target=run_generation_worker,
+        args=(loaded.target_model, gen_kwargs, streamer, generation_errors),
         daemon=True,
     )
     gen_thread.start()
@@ -324,6 +347,8 @@ def generate_turn(
     cprint("\nAssistant: ", C_LABEL)
     raw_output = stream_response(streamer, show_thinking=config.show_thinking)
     gen_thread.join()
+    if generation_errors:
+        raise RuntimeError(str(generation_errors[0])) from generation_errors[0]
     return raw_output
 
 
@@ -466,6 +491,12 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
     parser.add_argument("--num-assistant-tokens", type=int, default=DEFAULT_NUM_ASSISTANT_TOKENS)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--device-map", default="auto")
+    parser.add_argument(
+        "--stream-timeout",
+        type=float,
+        default=DEFAULT_STREAM_TIMEOUT,
+        help="Seconds to wait between streamed chunks before treating generation as stalled; disabled by default.",
+    )
     parser.add_argument("--no-thinking", action="store_true", help="Disable Gemma thinking prompts.")
     parser.add_argument("--hide-thinking", action="store_true", help="Do not print thinking blocks while streaming.")
     parser.add_argument("--disable-mtp", action="store_true", help="Run target-only generation without the MTP drafter.")
@@ -477,6 +508,8 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
         parser.error("--num-assistant-tokens must be positive")
     if args.temperature < 0:
         parser.error("--temperature must be non-negative")
+    if args.stream_timeout is not None and args.stream_timeout <= 0:
+        parser.error("--stream-timeout must be positive when set")
     if not 0 < args.top_p <= 1:
         parser.error("--top-p must be in the interval (0, 1]")
     if args.top_k < 0:
@@ -495,6 +528,7 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
         enable_mtp=not args.disable_mtp,
         dtype=args.dtype,
         device_map=args.device_map,
+        stream_timeout=args.stream_timeout,
     )
 
 
