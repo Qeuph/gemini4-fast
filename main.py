@@ -32,7 +32,7 @@ from transformers import (
 
 # ── Model IDs ─────────────────────────────────────────────────────────────────
 DEFAULT_TARGET_MODEL_ID = "google/gemma-4-E2B-it"
-DEFAULT_MTP_DRAFT_MODEL_ID = "google/gemma-4-31B-it-assistant"
+DEFAULT_MTP_DRAFT_MODEL_ID = "google/gemma-4-E2B-it-assistant"
 
 # ── Generation defaults (Gemma-family chat defaults) ──────────────────────────
 DEFAULT_MAX_NEW_TOKENS = 2048
