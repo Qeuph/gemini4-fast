@@ -6,7 +6,7 @@ Install: pip install -U transformers torch accelerate
 
 Models used:
   • google/gemma-4-E2B-it          ← target (main) model
-  • google/gemma-4-E2B-it-assistant ← drafter for speculative decoding
+  • google/gemma-4-31B-it-assistant← drafter for speculative decoding
 
 Commands during chat:
   quit / exit   → close the chatbot
@@ -27,7 +27,7 @@ from transformers import (
 
 # ── Model IDs ─────────────────────────────────────────────────────────────────
 TARGET_MODEL_ID    = "google/gemma-4-E2B-it"
-ASSISTANT_MODEL_ID = "google/gemma-4-E2B-it-assistant"
+ASSISTANT_MODEL_ID = "google/gemma-4-31B-it-assistant"
 
 # ── Generation defaults (Gemma 4 recommended) ─────────────────────────────────
 MAX_NEW_TOKENS = 2048
