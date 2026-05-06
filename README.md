@@ -5,7 +5,7 @@
 The target model remains responsible for the final distribution and verifies the draft tokens in parallel, so MTP keeps standard-generation quality while reducing latency on compatible hardware. The repo defaults to:
 
 - **Target model:** `google/gemma-4-E2B-it`
-- **MTP drafter:** `google/gemma-4-31B-it-assistant`
+- **MTP drafter:** `google/gemma-4-E2B-it-assistant`
 
 > This project is intended for environments where you have accepted the model licenses, have access to the checkpoints, and have enough CPU/GPU memory for both the target and draft models.
 
@@ -60,7 +60,7 @@ The app loads the processor, target model, and MTP drafter, then starts an inter
 ```bash
 python main.py \
   --target-model google/gemma-4-E2B-it \
-  --mtp-draft-model google/gemma-4-31B-it-assistant \
+  --mtp-draft-model google/gemma-4-E2B-it-assistant \
   --num-assistant-tokens 5 \
   --max-new-tokens 1024
 ```
