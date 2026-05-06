@@ -12,14 +12,23 @@ reducing end-to-end latency on supported hardware.
 from __future__ import annotations
 
 import argparse
+import itertools
+import readline  # Enables Unix line editing and command history for input().
 import sys
 import threading
-from dataclasses import dataclass
-from queue import Empty
+import time
+from dataclasses import dataclass, field
+from queue import Empty, Queue
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor, TextIteratorStreamer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    StoppingCriteria,
+    StoppingCriteriaList,
+    TextIteratorStreamer,
+)
 
 # ── Model IDs ─────────────────────────────────────────────────────────────────
 DEFAULT_TARGET_MODEL_ID = "google/gemma-4-E2B-it"
@@ -32,6 +41,7 @@ DEFAULT_TOP_P = 0.95
 DEFAULT_TOP_K = 64
 DEFAULT_NUM_ASSISTANT_TOKENS = 5
 DEFAULT_STREAM_TIMEOUT: float | None = None
+DEFAULT_MAX_HISTORY_TURNS: int | None = None
 
 # ── Gemma thinking-block delimiters ───────────────────────────────────────────
 THINK_OPEN_TAG = "<|channel>thought"
@@ -44,6 +54,30 @@ C_LABEL = "\033[1;33m"  # bold gold  → section labels
 C_CMD = "\033[1;34m"  # bold blue  → prompts/commands
 C_ERR = "\033[1;31m"  # bold red   → errors
 C_RESET = "\033[0m"
+
+
+class GenerationInterrupted(Exception):
+    """Raised when the user cancels an in-flight streaming generation."""
+
+
+class StopOnEvent(StoppingCriteria):
+    """Stop generation as soon as the controlling thread asks for cancellation."""
+
+    def __init__(self, stop_event: threading.Event) -> None:
+        self.stop_event = stop_event
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any) -> bool:
+        return self.stop_event.is_set()
+
+
+class ReusableTextIteratorStreamer(TextIteratorStreamer):
+    """TextIteratorStreamer with an explicit reset hook for sequential chat turns."""
+
+    def reset(self) -> None:
+        self.text_queue = Queue()
+        self.token_cache = []
+        self.print_len = 0
+        self.next_tokens_are_prompt = True
 
 
 @dataclass(slots=True)
@@ -63,6 +97,7 @@ class ChatConfig:
     dtype: str = "auto"
     device_map: str = "auto"
     stream_timeout: float | None = DEFAULT_STREAM_TIMEOUT
+    max_history_turns: int | None = DEFAULT_MAX_HISTORY_TURNS
 
 
 @dataclass(slots=True)
@@ -72,6 +107,8 @@ class LoadedModels:
     processor: Any
     target_model: Any
     mtp_draft_model: Any | None
+    streamer: ReusableTextIteratorStreamer
+    base_generation_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -97,6 +134,7 @@ def show_help(config: ChatConfig) -> None:
     cmds = [
         ("quit / exit", "End the session"),
         ("reset", "Clear conversation history"),
+        ("truncate [n]", "Keep only the last n turns (or configured default)"),
         ("think on/off", "Enable or disable thinking mode"),
         ("think show/hide", "Show or hide streamed thinking blocks"),
         ("mtp on/off", "Enable or disable MTP speculative decoding"),
@@ -107,16 +145,72 @@ def show_help(config: ChatConfig) -> None:
     cprint("\nAvailable commands:", C_LABEL)
     for cmd, desc in cmds:
         cprint(f"  {cmd:<18} {desc}", C_CMD)
+    cprint("\nInput tip: end a line with \\ to continue a multi-line prompt.", C_CMD)
     print_mtp_status(config)
 
 
 def print_mtp_status(config: ChatConfig) -> None:
     state = "ON" if config.enable_mtp else "OFF"
+    max_history = "unlimited" if config.max_history_turns is None else str(config.max_history_turns)
     cprint("\nMTP speculative decoding:", C_LABEL)
     cprint(f"  state:               {state}", C_CMD)
     cprint(f"  target model:        {config.target_model_id}", C_CMD)
     cprint(f"  MTP draft model:     {config.mtp_draft_model_id}", C_CMD)
-    cprint(f"  draft tokens/step:   {config.num_assistant_tokens}\n", C_CMD)
+    cprint(f"  draft tokens/step:   {config.num_assistant_tokens}", C_CMD)
+    cprint(f"  max history turns:   {max_history}\n", C_CMD)
+
+
+def format_loading_error(exc: Exception, config: ChatConfig) -> str:
+    """Return a concise loading error with actionable recovery suggestions."""
+    suggestions = [
+        "accept gated model terms on Hugging Face if required",
+        "run `huggingface-cli login` for private or gated checkpoints",
+        "verify --target-model and --mtp-draft-model are accessible model IDs",
+        "try `--device-map sequential` or a smaller model if automatic placement fails",
+        "try a smaller dtype/quantized setup if you hit CPU or GPU memory limits",
+    ]
+    details = str(exc).strip() or exc.__class__.__name__
+    return (
+        "Model loading failed.\n"
+        f"  target model:    {config.target_model_id}\n"
+        f"  MTP draft model: {config.mtp_draft_model_id if config.enable_mtp else '(disabled)'}\n"
+        f"  device map:      {config.device_map}\n"
+        f"  dtype:           {config.dtype}\n"
+        f"  error:           {details}\n\n"
+        "Suggestions:\n  - " + "\n  - ".join(suggestions)
+    )
+
+
+class LoadingSpinner:
+    """Small terminal spinner for model-loading steps that lack progress callbacks."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._enabled = sys.stdout.isatty()
+
+    def __enter__(self) -> LoadingSpinner:
+        if self._enabled:
+            self._thread.start()
+        else:
+            cprint(f"⏳  {self.message} …", C_LABEL)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self._done.set()
+        if self._enabled:
+            self._thread.join()
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+    def _spin(self) -> None:
+        for frame in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
+            if self._done.is_set():
+                break
+            sys.stdout.write(f"\r{frame}  {self.message} …")
+            sys.stdout.flush()
+            time.sleep(0.1)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -125,9 +219,13 @@ def print_mtp_status(config: ChatConfig) -> None:
 
 
 def system_content(enable_thinking: bool) -> str:
-    """Build a system message and opt in to model thinking when requested."""
-    base = "You are a helpful, thoughtful assistant."
-    return f"<|think|>\n{base}" if enable_thinking else base
+    """
+    Build a system message.
+
+    Thinking is controlled by apply_chat_template(enable_thinking=...), which
+    owns the model-specific special tokens. Do not manually prepend <|think|>.
+    """
+    return "You are a helpful, thoughtful assistant."
 
 
 def build_messages(history: list[dict[str, str]], enable_thinking: bool) -> list[dict[str, str]]:
@@ -136,15 +234,32 @@ def build_messages(history: list[dict[str, str]], enable_thinking: bool) -> list
 
 
 def extract_final_answer(raw: str) -> str:
-    """Strip Gemma thinking markup before storing assistant messages in history."""
-    close_idx = raw.find(THINK_CLOSE_TAG)
-    if close_idx != -1:
-        return raw[close_idx + len(THINK_CLOSE_TAG) :].strip()
-    return raw.strip()
+    """Strip all complete or dangling Gemma thinking blocks from assistant history."""
+    output_parts: list[str] = []
+    cursor = 0
+
+    while cursor < len(raw):
+        open_idx = raw.find(THINK_OPEN_TAG, cursor)
+        if open_idx == -1:
+            output_parts.append(raw[cursor:])
+            break
+
+        output_parts.append(raw[cursor:open_idx])
+        think_start = open_idx + len(THINK_OPEN_TAG)
+        close_idx = raw.find(THINK_CLOSE_TAG, think_start)
+        if close_idx == -1:
+            cprint(
+                "[Warning: unterminated thinking block discarded from saved history]",
+                C_ERR,
+            )
+            break
+        cursor = close_idx + len(THINK_CLOSE_TAG)
+
+    return "".join(output_parts).strip()
 
 
 def parse_final_answer(processor: Any, raw_output: str, enable_thinking: bool) -> str:
-    """Use processor parsing when available, with a delimiter-based fallback."""
+    """Use processor parsing when available, then sanitize thinking markup."""
     if not raw_output:
         return ""
     if not enable_thinking:
@@ -155,8 +270,11 @@ def parse_final_answer(processor: Any, raw_output: str, enable_thinking: bool) -
         try:
             parsed = parse_response(raw_output)
             if isinstance(parsed, dict):
-                return str(parsed.get("text", "")).strip()
-            return str(parsed).strip()
+                parsed_text = str(parsed.get("text", "")).strip()
+            else:
+                parsed_text = str(parsed).strip()
+            if THINK_OPEN_TAG not in parsed_text and THINK_CLOSE_TAG not in parsed_text:
+                return parsed_text
         except (AttributeError, KeyError, TypeError, ValueError):
             pass
 
@@ -173,7 +291,33 @@ def render_chunk(buf: str, in_think: bool, show_thinking: bool) -> None:
         cprint(buf, C_ANSWER, end="", flush=True)
 
 
-def stream_response(streamer: TextIteratorStreamer, show_thinking: bool) -> str:
+def render_tps(token_count: int, started_at: float, final: bool = False) -> None:
+    """Render a lightweight approximate token-per-second indicator on TTYs."""
+    if not sys.stderr.isatty():
+        return
+    elapsed = max(time.perf_counter() - started_at, 1e-9)
+    suffix = "\n" if final else ""
+    sys.stderr.write(f"\r[~{token_count / elapsed:6.2f} tok/s, {token_count} tokens]{suffix}")
+    sys.stderr.flush()
+
+
+def estimate_token_count(tokenizer: Any, text: str) -> int:
+    """Approximate token count for finalized streamer text."""
+    encode = getattr(tokenizer, "encode", None)
+    if callable(encode):
+        try:
+            return max(1, len(encode(text, add_special_tokens=False)))
+        except (TypeError, ValueError):
+            pass
+    return 1 if text else 0
+
+
+def stream_response(
+    streamer: TextIteratorStreamer,
+    tokenizer: Any,
+    show_thinking: bool,
+    stop_event: threading.Event,
+) -> str:
     """
     Consume streamed text, render thinking separately from final answers, and
     return the raw model output for history parsing.
@@ -181,13 +325,16 @@ def stream_response(streamer: TextIteratorStreamer, show_thinking: bool) -> str:
     raw_output = ""
     in_thinking = False
     buffer = ""
-
+    token_count = 0
+    started_at = time.perf_counter()
     max_lookahead = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG)) - 1
 
     try:
         for token in streamer:
+            token_count += estimate_token_count(tokenizer, token)
             raw_output += token
             buffer += token
+            render_tps(token_count, started_at)
 
             while True:
                 if not in_thinking:
@@ -222,8 +369,14 @@ def stream_response(streamer: TextIteratorStreamer, show_thinking: bool) -> str:
                             render_chunk(buffer[:safe_len], in_think=True, show_thinking=show_thinking)
                             buffer = buffer[safe_len:]
                         break
+    except KeyboardInterrupt as exc:
+        stop_event.set()
+        streamer.end()
+        raise GenerationInterrupted from exc
     except Empty as exc:
         raise RuntimeError("timed out waiting for streamed model output") from exc
+    finally:
+        render_tps(token_count, started_at, final=True)
 
     render_chunk(buffer, in_think=in_thinking, show_thinking=show_thinking)
     print()
@@ -235,32 +388,58 @@ def stream_response(streamer: TextIteratorStreamer, show_thinking: bool) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
+def make_base_generation_kwargs(config: ChatConfig) -> dict[str, Any]:
+    """Cache generation settings that stay constant across turns."""
+    return {
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "top_k": config.top_k,
+        "do_sample": config.temperature > 0,
+    }
+
+
 def load_models(config: ChatConfig) -> LoadedModels:
     """Load the target model and, when enabled, its MTP drafter."""
-    cprint("⏳  Loading processor …", C_LABEL)
-    processor = AutoProcessor.from_pretrained(config.target_model_id)
+    try:
+        with LoadingSpinner("Loading processor"):
+            processor = AutoProcessor.from_pretrained(config.target_model_id)
 
-    cprint("⏳  Loading target model …", C_LABEL)
-    target_model = AutoModelForCausalLM.from_pretrained(
-        config.target_model_id,
-        dtype=config.dtype,
-        device_map=config.device_map,
-    )
-    target_model.eval()
+        with LoadingSpinner("Loading target model"):
+            target_model = AutoModelForCausalLM.from_pretrained(
+                config.target_model_id,
+                dtype=config.dtype,
+                device_map=config.device_map,
+            )
+            target_model.eval()
 
-    mtp_draft_model = None
-    if config.enable_mtp:
-        cprint("⏳  Loading MTP drafter model …", C_LABEL)
-        mtp_draft_model = AutoModelForCausalLM.from_pretrained(
-            config.mtp_draft_model_id,
-            dtype=config.dtype,
-            device_map=config.device_map,
-        )
-        mtp_draft_model.eval()
+        mtp_draft_model = None
+        if config.enable_mtp:
+            with LoadingSpinner("Loading MTP drafter model"):
+                mtp_draft_model = AutoModelForCausalLM.from_pretrained(
+                    config.mtp_draft_model_id,
+                    dtype=config.dtype,
+                    device_map=config.device_map,
+                )
+                mtp_draft_model.eval()
+    except Exception as exc:
+        raise RuntimeError(format_loading_error(exc, config)) from exc
 
     cprint("✅  Models loaded.", C_LABEL)
     print_mtp_status(config)
-    return LoadedModels(processor, target_model, mtp_draft_model)
+    tokenizer = getattr(processor, "tokenizer", processor)
+    streamer = ReusableTextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=False,
+        timeout=config.stream_timeout,
+    )
+    return LoadedModels(
+        processor=processor,
+        target_model=target_model,
+        mtp_draft_model=mtp_draft_model,
+        streamer=streamer,
+        base_generation_kwargs=make_base_generation_kwargs(config),
+    )
 
 
 def model_input_device(target_model: Any) -> torch.device | str:
@@ -268,6 +447,13 @@ def model_input_device(target_model: Any) -> torch.device | str:
     device = getattr(target_model, "device", None)
     if device is not None:
         return device
+
+    input_embeddings = getattr(target_model, "get_input_embeddings", lambda: None)()
+    embedding_weight = getattr(input_embeddings, "weight", None)
+    embedding_device = getattr(embedding_weight, "device", None)
+    if embedding_device is not None:
+        return embedding_device
+
     for parameter in target_model.parameters():
         return parameter.device
     return "cpu"
@@ -278,16 +464,15 @@ def build_generation_kwargs(
     loaded: LoadedModels,
     inputs: Any,
     streamer: TextIteratorStreamer,
+    stopping_criteria: StoppingCriteriaList,
 ) -> dict[str, Any]:
     """Create generation kwargs and attach the MTP drafter when active."""
     gen_kwargs: dict[str, Any] = {
+        **loaded.base_generation_kwargs,
         **inputs,
         "max_new_tokens": config.max_new_tokens,
-        "temperature": config.temperature,
-        "top_p": config.top_p,
-        "top_k": config.top_k,
-        "do_sample": config.temperature > 0,
         "streamer": streamer,
+        "stopping_criteria": stopping_criteria,
     }
 
     if config.enable_mtp and loaded.mtp_draft_model is not None:
@@ -327,14 +512,12 @@ def generate_turn(
     )
 
     inputs = loaded.processor(text=text, return_tensors="pt").to(model_input_device(loaded.target_model))
-    tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
-    streamer = TextIteratorStreamer(
-        tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=False,
-        timeout=config.stream_timeout,
-    )
-    gen_kwargs = build_generation_kwargs(config, loaded, inputs, streamer)
+    streamer = loaded.streamer
+    streamer.timeout = config.stream_timeout
+    streamer.reset()
+    stop_event = threading.Event()
+    stopping_criteria = StoppingCriteriaList([StopOnEvent(stop_event)])
+    gen_kwargs = build_generation_kwargs(config, loaded, inputs, streamer, stopping_criteria)
     generation_errors: list[Exception] = []
 
     gen_thread = threading.Thread(
@@ -345,7 +528,27 @@ def generate_turn(
     gen_thread.start()
 
     cprint("\nAssistant: ", C_LABEL)
-    raw_output = stream_response(streamer, show_thinking=config.show_thinking)
+    try:
+        tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
+        raw_output = stream_response(
+            streamer,
+            tokenizer=tokenizer,
+            show_thinking=config.show_thinking,
+            stop_event=stop_event,
+        )
+    except GenerationInterrupted:
+        gen_thread.join(timeout=5)
+        if gen_thread.is_alive():
+            tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
+            loaded.streamer = ReusableTextIteratorStreamer(
+                tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=False,
+                timeout=config.stream_timeout,
+            )
+        cprint("\n[Generation interrupted — returning to prompt]", C_ERR)
+        return ""
+
     gen_thread.join()
     if generation_errors:
         raise RuntimeError(str(generation_errors[0])) from generation_errors[0]
@@ -355,6 +558,35 @@ def generate_turn(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Command handling and chat loop
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+def truncate_history(history: list[dict[str, str]], max_turns: int | None) -> int:
+    """Keep only the most recent user turns and associated assistant messages."""
+    if max_turns is None or max_turns <= 0:
+        return 0
+
+    user_turns_seen = 0
+    keep_start = 0
+    for idx in range(len(history) - 1, -1, -1):
+        if history[idx].get("role") == "user":
+            user_turns_seen += 1
+            if user_turns_seen == max_turns:
+                keep_start = idx
+                break
+    else:
+        keep_start = 0
+
+    if user_turns_seen < max_turns:
+        return 0
+
+    removed = keep_start
+    if removed > 0:
+        del history[:keep_start]
+    return removed
+
+
+def parse_positive_int(value: str) -> int | None:
+    return int(value) if value.isdigit() and int(value) > 0 else None
 
 
 def handle_command(
@@ -369,6 +601,23 @@ def handle_command(
     if lower == "reset":
         history.clear()
         cprint("[History cleared]\n", C_LABEL)
+        return True
+
+    if lower == "truncate" or lower.startswith("truncate "):
+        parts = user_input.split(maxsplit=1)
+        if len(parts) == 2:
+            max_turns = parse_positive_int(parts[1])
+            if max_turns is None:
+                cprint("[Usage: truncate [positive integer]]\n", C_ERR)
+                return True
+        elif config.max_history_turns is not None:
+            max_turns = config.max_history_turns
+        else:
+            cprint("[Usage: truncate <positive integer> or start with --max-history-turns]\n", C_ERR)
+            return True
+
+        removed = truncate_history(history, max_turns)
+        cprint(f"[History truncated to last {max_turns} turn(s); removed {removed} message(s)]\n", C_LABEL)
         return True
 
     if lower == "think on":
@@ -413,8 +662,9 @@ def handle_command(
 
     if lower.startswith("tokens "):
         _, value = user_input.split(maxsplit=1)
-        if value.isdigit() and int(value) > 0:
-            config.max_new_tokens = int(value)
+        max_tokens = parse_positive_int(value)
+        if max_tokens is not None:
+            config.max_new_tokens = max_tokens
             cprint(f"[max_new_tokens set to {config.max_new_tokens}]\n", C_LABEL)
         else:
             cprint("[Usage: tokens <positive integer>]\n", C_ERR)
@@ -427,12 +677,28 @@ def handle_command(
     return False
 
 
+def read_multiline_input() -> str:
+    """Read one prompt, continuing when a line ends with a backslash."""
+    lines: list[str] = []
+    prompt = "You: "
+
+    while True:
+        cprint(prompt, C_CMD, end="", flush=True)
+        line = input()
+        if line.endswith("\\"):
+            lines.append(line[:-1])
+            prompt = "...  "
+            continue
+        lines.append(line)
+        return "\n".join(lines).strip()
+
+
 def chat(config: ChatConfig, loaded: LoadedModels) -> None:
     history: list[dict[str, str]] = []
 
     banner = (
         "╔══════════════════════════════════════════════════════╗\n"
-        "║ Gemma 4 · MTP Speculative Decoding Chatbot · v2.0  ║\n"
+        "║ Gemma 4 · MTP Speculative Decoding Chatbot · v2.1  ║\n"
         "╚══════════════════════════════════════════════════════╝\n"
         "  Type /help for commands. MTP is enabled by default.\n"
     )
@@ -440,8 +706,7 @@ def chat(config: ChatConfig, loaded: LoadedModels) -> None:
 
     while True:
         try:
-            cprint("You: ", C_CMD, end="", flush=True)
-            user_input = input().strip()
+            user_input = read_multiline_input()
         except (EOFError, KeyboardInterrupt):
             cprint("\nGoodbye!", C_LABEL)
             break
@@ -457,6 +722,7 @@ def chat(config: ChatConfig, loaded: LoadedModels) -> None:
             continue
 
         history.append({"role": "user", "content": user_input})
+        truncate_history(history, config.max_history_turns)
 
         try:
             raw_output = generate_turn(config, loaded, history)
@@ -466,9 +732,15 @@ def chat(config: ChatConfig, loaded: LoadedModels) -> None:
             cprint("[User turn removed from history]\n", C_ERR)
             continue
 
+        if not raw_output:
+            history.pop()
+            cprint("[User turn removed from history]\n", C_ERR)
+            continue
+
         final_answer = parse_final_answer(loaded.processor, raw_output, config.enable_thinking)
         if final_answer:
             history.append({"role": "assistant", "content": final_answer})
+            truncate_history(history, config.max_history_turns)
         else:
             history.pop()
             cprint("[No response generated — user turn removed from history]\n", C_ERR)
@@ -497,6 +769,12 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
         default=DEFAULT_STREAM_TIMEOUT,
         help="Seconds to wait between streamed chunks before treating generation as stalled; disabled by default.",
     )
+    parser.add_argument(
+        "--max-history-turns",
+        type=int,
+        default=DEFAULT_MAX_HISTORY_TURNS,
+        help="Maximum user/assistant turns to keep in context; disabled by default.",
+    )
     parser.add_argument("--no-thinking", action="store_true", help="Disable Gemma thinking prompts.")
     parser.add_argument("--hide-thinking", action="store_true", help="Do not print thinking blocks while streaming.")
     parser.add_argument("--disable-mtp", action="store_true", help="Run target-only generation without the MTP drafter.")
@@ -510,6 +788,8 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
         parser.error("--temperature must be non-negative")
     if args.stream_timeout is not None and args.stream_timeout <= 0:
         parser.error("--stream-timeout must be positive when set")
+    if args.max_history_turns is not None and args.max_history_turns <= 0:
+        parser.error("--max-history-turns must be positive when set")
     if not 0 < args.top_p <= 1:
         parser.error("--top-p must be in the interval (0, 1]")
     if args.top_k < 0:
@@ -529,12 +809,17 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
         dtype=args.dtype,
         device_map=args.device_map,
         stream_timeout=args.stream_timeout,
+        max_history_turns=args.max_history_turns,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     config = parse_args(argv)
-    loaded = load_models(config)
+    try:
+        loaded = load_models(config)
+    except RuntimeError as exc:
+        cprint(f"\n{exc}\n", C_ERR)
+        return 1
     chat(config, loaded)
     return 0
 
