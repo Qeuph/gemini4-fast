@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import readline  # Enables Unix line editing and command history for input().
+try:
+    import readline  # Enables Unix line editing and command history for input().
+except ImportError:
+    readline = None
 import sys
 import termios
 import threading
@@ -43,8 +46,8 @@ DEFAULT_TOP_K = 64
 DEFAULT_NUM_ASSISTANT_TOKENS = 5
 DEFAULT_STREAM_TIMEOUT: float | None = None
 DEFAULT_MAX_HISTORY_TURNS: int | None = None
-DEFAULT_SHOW_THINKING = False
-DEFAULT_SHOW_TPS = False
+DEFAULT_SHOW_THINKING = True
+DEFAULT_SHOW_TPS = True
 
 # ── Gemma thinking-block delimiters ───────────────────────────────────────────
 THINK_OPEN_TAG = "<|channel>thought"
@@ -56,8 +59,8 @@ GENERATED_SPECIAL_TOKENS = (
 )
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
-C_THINK = "\033[2;36m"  # dim cyan   → thinking block
-C_ANSWER = "\033[0;32m"  # green      → final answer
+C_THINK = "\033[1;36m"  # bold cyan  → thinking block
+C_ANSWER = "\033[0m"     # reset      → final answer (use default text color)
 C_LABEL = "\033[1;33m"  # bold gold  → section labels
 C_CMD = "\033[1;34m"  # bold blue  → prompts/commands
 C_ERR = "\033[1;31m"  # bold red   → errors
@@ -141,19 +144,23 @@ def cprint(text: str, color: str = C_RESET, end: str = "\n", flush: bool = False
 
 def ensure_terminal_echo() -> None:
     """Best-effort restore of stdin echo before prompting for user input."""
-    if not sys.stdin.isatty():
-        return
+    # In some environments like Google Colab, standard termios calls might fail
+    # or not be necessary, but we try anyway.
     try:
-        attrs = termios.tcgetattr(sys.stdin.fileno())
-    except termios.error:
-        return
-    if attrs[3] & termios.ECHO:
-        return
-    attrs[3] |= termios.ECHO
-    try:
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attrs)
-    except termios.error:
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        if not (attrs[3] & termios.ECHO):
+            attrs[3] |= termios.ECHO
+            termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+    except Exception:
+        # If termios fails, we can't do much more for echo, but we shouldn't crash.
         pass
+
+    # Additionally, some notebook environments might need a manual reset if they've
+    # been messed up by interrupted processes.
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[m")  # Reset all attributes
+        sys.stdout.flush()
 
 
 def show_help(config: ChatConfig) -> None:
@@ -338,13 +345,32 @@ def find_first_marker(buffer: str, markers: tuple[str, ...]) -> tuple[int, str] 
 
 
 def render_tps(token_count: int, started_at: float, show_tps: bool, final: bool = False) -> None:
-    """Render a lightweight approximate token-per-second indicator on TTYs."""
-    if not show_tps or not sys.stderr.isatty():
+    """Render a live token-per-second indicator on a dedicated bottom line."""
+    if not show_tps:
         return
+
     elapsed = max(time.perf_counter() - started_at, 1e-9)
-    suffix = "\n" if final else ""
-    sys.stderr.write(f"\r[~{token_count / elapsed:6.2f} tok/s, {token_count} tokens]{suffix}")
-    sys.stderr.flush()
+    tps = token_count / elapsed
+
+    # ANSI escape codes:
+    # \033[s   : Save cursor position
+    # \033[u   : Restore cursor position
+    # \033[K   : Clear line from cursor to end
+    # \033[1B  : Move cursor down 1 line
+    # \033[1A  : Move cursor up 1 line
+
+    if final:
+        # On final, we just print it normally on a new line and stay there.
+        sys.stdout.write(f"\n{C_LABEL}[~{tps:6.2f} tok/s, {token_count} tokens]{C_RESET}\n")
+        sys.stdout.flush()
+    else:
+        # For live updates: save position, move to next line, print, restore position.
+        # We use stdout instead of stderr to ensure they share the same buffer/position.
+        sys.stdout.write("\033[s")  # Save cursor
+        sys.stdout.write("\n\033[K")  # Move down and clear line
+        sys.stdout.write(f"{C_LABEL}[~{tps:6.2f} tok/s, {token_count} tokens]{C_RESET}")
+        sys.stdout.write("\033[u")  # Restore cursor
+        sys.stdout.flush()
 
 
 def estimate_token_count(tokenizer: Any, text: str) -> int:
@@ -402,11 +428,11 @@ def stream_response(
                 if marker == THINK_OPEN_TAG:
                     in_thinking = True
                     if show_thinking:
-                        cprint("\n── thinking ──", C_LABEL)
+                        cprint("\n💭 Thinking...", C_LABEL)
                 elif marker == THINK_CLOSE_TAG:
                     in_thinking = False
                     if show_thinking:
-                        cprint("\n── answer ────", C_LABEL)
+                        cprint("\n\n✨ Answer:", C_LABEL)
 
                 buffer = buffer[len(marker) :]
     except KeyboardInterrupt as exc:
@@ -416,10 +442,13 @@ def stream_response(
     except Empty as exc:
         raise RuntimeError("timed out waiting for streamed model output") from exc
     finally:
-        render_tps(token_count, started_at, show_tps, final=True)
+        # Render any remaining text in the buffer before finishing.
+        render_chunk(strip_generated_special_tokens(buffer), in_think=in_thinking, show_thinking=show_thinking)
+        if show_tps:
+            render_tps(token_count, started_at, show_tps, final=True)
+        else:
+            print()
 
-    render_chunk(strip_generated_special_tokens(buffer), in_think=in_thinking, show_thinking=show_thinking)
-    print()
     return raw_output
 
 
@@ -567,7 +596,8 @@ def generate_turn(
     )
     gen_thread.start()
 
-    cprint("\nAssistant: ", C_LABEL)
+    cprint("\n" + "─" * 40, C_LABEL)
+    cprint("Assistant:", C_LABEL)
     try:
         tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
         raw_output = stream_response(
@@ -577,9 +607,11 @@ def generate_turn(
             show_tps=config.show_tps,
             stop_event=stop_event,
         )
-    except GenerationInterrupted:
-        gen_thread.join(timeout=5)
+    except (GenerationInterrupted, KeyboardInterrupt):
+        stop_event.set()
+        gen_thread.join(timeout=2)
         if gen_thread.is_alive():
+            # If thread won't die, we have to recreate the streamer to unblock queues
             tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
             loaded.streamer = ReusableTextIteratorStreamer(
                 tokenizer,
@@ -587,10 +619,15 @@ def generate_turn(
                 skip_special_tokens=False,
                 timeout=config.stream_timeout,
             )
-        cprint("\n[Generation interrupted — returning to prompt]", C_ERR)
+        cprint("\n\n[Generation interrupted]", C_ERR)
+        return ""
+    except Exception as exc:
+        stop_event.set()
+        gen_thread.join(timeout=2)
+        cprint(f"\n\n[Error during generation: {exc}]", C_ERR)
         return ""
 
-    gen_thread.join()
+    gen_thread.join(timeout=5)
     if generation_errors:
         raise RuntimeError(str(generation_errors[0])) from generation_errors[0]
     return raw_output
@@ -735,8 +772,20 @@ def read_multiline_input() -> str:
 
     while True:
         ensure_terminal_echo()
+        # In Colab/Notebooks, input() usually handles its own echo.
+        # The issue might be coming from readline if it's not well-supported.
         cprint(prompt, C_CMD, end="", flush=True)
-        line = input()
+        try:
+            line = input()
+        except EOFError:
+            raise
+        except KeyboardInterrupt:
+            # If they hit Ctrl+C at the prompt, just clear the line and start over.
+            print()
+            lines = []
+            prompt = "You: "
+            continue
+
         if line.endswith("\\"):
             lines.append(line[:-1])
             prompt = "...  "
@@ -749,19 +798,26 @@ def chat(config: ChatConfig, loaded: LoadedModels) -> None:
     history: list[dict[str, str]] = []
 
     banner = (
-        "╔══════════════════════════════════════════════════════╗\n"
-        "║ Gemma 4 · MTP Speculative Decoding Chatbot · v2.1  ║\n"
-        "╚══════════════════════════════════════════════════════╝\n"
-        "  Type /help for commands. MTP is enabled by default; thinking is hidden by default.\n"
+        "\033[1;36m"
+        "╭──────────────────────────────────────────────────────╮\n"
+        "│  Gemma 4 · MTP Speculative Decoding Chatbot · v2.1   │\n"
+        "╰──────────────────────────────────────────────────────╯\n"
+        "\033[0m"
+        "  Type \033[1;34m/help\033[0m for commands. MTP, Thinking, and TPS are \033[1;32mON\033[0m.\n"
     )
     cprint(banner, C_LABEL)
 
     while True:
         try:
             user_input = read_multiline_input()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             cprint("\nGoodbye!", C_LABEL)
             break
+        except KeyboardInterrupt:
+            # This is already handled in read_multiline_input for the prompt,
+            # but we catch it here just in case.
+            print()
+            continue
 
         if not user_input:
             continue
@@ -828,12 +884,12 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
         help="Maximum user/assistant turns to keep in context; disabled by default.",
     )
     parser.add_argument("--no-thinking", action="store_true", help="Disable Gemma thinking prompts.")
-    parser.add_argument("--show-thinking", action="store_true", help="Print thinking blocks while streaming.")
+    parser.add_argument("--hide-thinking", action="store_true", help="Hide thinking blocks while streaming.")
     parser.add_argument("--disable-mtp", action="store_true", help="Run target-only generation without the MTP drafter.")
     parser.add_argument(
-        "--show-tps",
+        "--hide-tps",
         action="store_true",
-        help="Print live token-per-second stats while streaming. Disabled by default to avoid corrupting streamed text on some terminals.",
+        help="Hide live token-per-second stats while streaming.",
     )
 
     args = parser.parse_args(argv)
@@ -861,13 +917,13 @@ def parse_args(argv: list[str] | None = None) -> ChatConfig:
         top_k=args.top_k,
         num_assistant_tokens=args.num_assistant_tokens,
         enable_thinking=not args.no_thinking,
-        show_thinking=args.show_thinking,
+        show_thinking=not args.hide_thinking,
         enable_mtp=not args.disable_mtp,
         dtype=args.dtype,
         device_map=args.device_map,
         stream_timeout=args.stream_timeout,
         max_history_turns=args.max_history_turns,
-        show_tps=args.show_tps,
+        show_tps=not args.hide_tps,
     )
 
 
